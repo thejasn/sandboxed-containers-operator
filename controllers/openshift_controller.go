@@ -17,25 +17,19 @@ package controllers
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
 	"reflect"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 
 	"k8s.io/apimachinery/pkg/labels"
 
-	ignTypes "github.com/coreos/ignition/v2/config/v3_2/types"
 	"github.com/go-logr/logr"
-	configv1 "github.com/openshift/api/config/v1"
 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 	secv1 "github.com/openshift/api/security/v1"
-	"github.com/openshift/machine-config-operator/pkg/apihelpers"
 	kataconfigurationv1 "github.com/openshift/sandboxed-containers-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodeapi "k8s.io/api/node/v1"
@@ -64,11 +58,6 @@ type KataConfigOpenShiftReconciler struct {
 	ImgMc *mcfgv1.MachineConfig
 
 	DeploymentMode DeploymentMode
-}
-
-type customKernelConfig struct {
-	Image      string
-	KernelPath string
 }
 
 const (
@@ -279,119 +268,6 @@ func (r *KataConfigOpenShiftReconciler) IsKataConfigStatusChanged(oldStatus, new
 	return !reflect.DeepEqual(oldStatusCopy, newStatusCopy)
 }
 
-func makeContainerRuntimeConfig(desiredLogLevel string, mcpSelector *metav1.LabelSelector) *mcfgv1.ContainerRuntimeConfig {
-	return &mcfgv1.ContainerRuntimeConfig{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "machineconfiguration.openshift.io/v1",
-			Kind:       "ContainerRuntimeConfig",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: container_runtime_config_name,
-		},
-		Spec: mcfgv1.ContainerRuntimeConfigSpec{
-			MachineConfigPoolSelector: mcpSelector,
-			ContainerRuntimeConfig: &mcfgv1.ContainerRuntimeConfiguration{
-				LogLevel: desiredLogLevel,
-			},
-		},
-	}
-}
-
-func (r *KataConfigOpenShiftReconciler) processLogLevel(desiredLogLevel string) error {
-
-	if desiredLogLevel == "" {
-		r.Log.Info("desired logLevel value is empty, setting to default ('info')")
-		desiredLogLevel = "info"
-	}
-
-	ctrRuntimeCfg := &mcfgv1.ContainerRuntimeConfig{}
-	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: container_runtime_config_name}, ctrRuntimeCfg)
-	if err != nil {
-		if !k8serrors.IsNotFound(err) {
-			r.Log.Error(err, "could not get ContainerRuntimeConfig, try again")
-			return err
-		}
-
-		r.Log.Info("no existing ContainerRuntimeConfig found")
-
-		if desiredLogLevel == "info" {
-			// if there's no ContainerRuntimeConfig - meaning that logLevel
-			// wasn't set yet and thus is at the default value in the cluster -
-			// *and* the desired value is the default one as well, there's
-			// nothing to do
-			r.Log.Info("current and desired logLevel values are both default, no action necessary")
-			return nil
-		}
-
-		machineConfigPoolSelectorLabels := map[string]string{"pools.operator.machineconfiguration.openshift.io/kata-oc": ""}
-		isConvergedCluster, err := r.checkConvergedCluster()
-		if isConvergedCluster && err == nil {
-			machineConfigPoolSelectorLabels = map[string]string{"pools.operator.machineconfiguration.openshift.io/master": ""}
-		}
-
-		machineConfigPoolSelector := &metav1.LabelSelector{
-			MatchLabels: machineConfigPoolSelectorLabels,
-		}
-
-		ctrRuntimeCfg = makeContainerRuntimeConfig(desiredLogLevel, machineConfigPoolSelector)
-
-		r.Log.Info("creating ContainerRuntimeConfig")
-		err = r.Client.Create(context.TODO(), ctrRuntimeCfg)
-		if err != nil {
-			r.Log.Error(err, "error creating ContainerRuntimeConfig")
-			return err
-		}
-		r.Log.Info("ContainerRuntimeConfig created successfully")
-	} else {
-		r.Log.Info("existing ContainerRuntimeConfig found")
-		if ctrRuntimeCfg.Spec.ContainerRuntimeConfig.LogLevel == desiredLogLevel {
-			r.Log.Info("existing ContainerRuntimeConfig is up-to-date, no action necessary")
-			return nil
-		}
-		// We only update LogLevel and don't touch MachineConfigPoolSelector
-		// as that shouldn't be necessary.  It selects an MCP based only on
-		// whether the cluster is converged or not.  Assuming that being
-		// converged is an immutable property of any given cluster, the initial
-		// choice of MachineConfigPoolSelector value should always be valid.
-		ctrRuntimeCfg.Spec.ContainerRuntimeConfig.LogLevel = desiredLogLevel
-
-		r.Log.Info("updating ContainerRuntimeConfig")
-		err = r.Client.Update(context.TODO(), ctrRuntimeCfg)
-		if err != nil {
-			r.Log.Error(err, "error updating ContainerRuntimeConfig")
-			return err
-		}
-		r.Log.Info("ContainerRuntimeConfig updated successfully")
-	}
-
-	return nil
-}
-
-func (r *KataConfigOpenShiftReconciler) removeLogLevel() error {
-
-	r.Log.Info("removing logLevel ContainerRuntimeConfig")
-
-	ctrRuntimeCfg := &mcfgv1.ContainerRuntimeConfig{}
-	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: container_runtime_config_name}, ctrRuntimeCfg)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			r.Log.Info("no logLevel ContainerRuntimeConfig found, nothing to do")
-			return nil
-		} else {
-			r.Log.Info("could not get ContainerRuntimeConfig", "err", err)
-			return err
-		}
-	}
-
-	err = r.Client.Delete(context.TODO(), ctrRuntimeCfg)
-	if err != nil {
-		r.Log.Info("error deleting ContainerRuntimeConfig", "err", err)
-		return err
-	}
-	r.Log.Info("logLevel ContainerRuntimeConfig deleted successfully")
-	return nil
-}
-
 func (r *KataConfigOpenShiftReconciler) processDaemonsetForMonitor() *appsv1.DaemonSet {
 	var (
 		runPrivileged = false
@@ -521,183 +397,6 @@ func (r *KataConfigOpenShiftReconciler) processDashboardConfigMap() *corev1.Conf
 	}
 }
 
-func (r *KataConfigOpenShiftReconciler) newMCPforCR() *mcfgv1.MachineConfigPool {
-	lsr := metav1.LabelSelectorRequirement{
-		Key:      "machineconfiguration.openshift.io/role",
-		Operator: metav1.LabelSelectorOpIn,
-		Values:   []string{"kata-oc", "worker"},
-	}
-
-	mcp := &mcfgv1.MachineConfigPool{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "machineconfiguration.openshift.io/v1",
-			Kind:       "MachineConfigPool",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "kata-oc",
-			Labels: map[string]string{
-				// This label is added to make it possible to form a label
-				// selector that selects this MCP.  One use case is the
-				// ContainerRuntimeConfig resource which selects MCPs based
-				// on labels and is used to implement KataConfig.spec.logLevel
-				// handling.
-				"pools.operator.machineconfiguration.openshift.io/kata-oc": "",
-			},
-		},
-
-		Spec: mcfgv1.MachineConfigPoolSpec{
-			MachineConfigSelector: &metav1.LabelSelector{
-				MatchExpressions: []metav1.LabelSelectorRequirement{lsr},
-			},
-			NodeSelector: r.getNodeSelectorAsLabelSelector(),
-		},
-	}
-
-	return mcp
-}
-
-func (r *KataConfigOpenShiftReconciler) getExtensionName() (string, error) {
-	// RHCOS uses "sandboxed-containers" as thats resolved/translated in the machine-config-operator to "kata-containers"
-	// FCOS/SCOS however does not get any translation in the machine-config-operator so we need to
-	// send in "kata-containers".
-	// Both are later send to rpm-ostree for installation.
-	//
-	extension := os.Getenv("SANDBOXED_CONTAINERS_EXTENSION")
-	if len(extension) != 0 {
-		return extension, nil
-	}
-
-	// FIXME: Look into having a single util function to return the ClusterVersion
-	clusterVersion := &configv1.ClusterVersion{}
-	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: "version"}, clusterVersion)
-	if err != nil {
-		return "", err
-	}
-
-	if strings.HasPrefix(clusterVersion.Status.Desired.Image, "quay.io/openshift-release-dev/ocp-release") {
-		return "sandboxed-containers", nil // RHCOS
-	}
-
-	if strings.HasPrefix(clusterVersion.Status.Desired.Image, "quay.io/okd/scos-release") {
-		return "kata-containers", nil // SCOS
-	}
-
-	cmdline, err := os.ReadFile("/proc/cmdline")
-	if err == nil && strings.Contains(string(cmdline), "ostree/rhcos") {
-		return "sandboxed-containers", nil // RHCOS
-	}
-
-	// As RHCOS is rather special variant, use "kata-containers" by default, which also applies to FCOS/SCOS
-	return "kata-containers", nil
-}
-
-// getCustomKernelConfig retrieves the kata addon configuration from the "kata-addon-artifacts" ConfigMap in the operator namespace.
-// This configuration contains the addon image reference and kernel path required for kata-se (IBM Secure Execution) deployments.
-// NOTE: This logic is applicable only for kata-se / IBM Secure Execution (s390x).
-func (r *KataConfigOpenShiftReconciler) getCustomKernelConfig(ctx context.Context) (*customKernelConfig, error) {
-	cm := &corev1.ConfigMap{}
-	err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      KataAddonConfigMapName,
-		Namespace: OperatorNamespace,
-	}, cm)
-
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			r.Log.Info("Skipping custom kernel addon, ConfigMap not found", "ConfigMap", KataAddonConfigMapName)
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	image := cm.Data["addonImage"]
-	kernel := cm.Data["kernelPath"]
-
-	if image == "" || kernel == "" {
-		r.Log.Info("Skipping custom kernel addon, image or kernel not found in ConfigMap", "ConfigMap", KataAddonConfigMapName)
-		return nil, nil
-	}
-
-	return &customKernelConfig{
-		Image:      image,
-		KernelPath: kernel,
-	}, nil
-}
-
-func (r *KataConfigOpenShiftReconciler) newMCForCR(machinePool string, customKernelCfg *customKernelConfig) (*mcfgv1.MachineConfig, error) {
-	r.Log.Info("Creating MachineConfig for Custom Resource")
-
-	if r.ImgMc != nil {
-		r.Log.Info("Image based MachineConfig", "MachineConfig", r.ImgMc)
-		return r.ImgMc, nil
-	}
-
-	// Create extension MachineConfig
-	ic := ignTypes.Config{
-		Ignition: ignTypes.Ignition{
-			Version: "3.2.0",
-		},
-	}
-
-	if customKernelCfg != nil {
-		mode := 0644
-
-		configContent := fmt.Sprintf(
-			"IMAGE=%s\nKERNEL=%s\n",
-			customKernelCfg.Image,
-			customKernelCfg.KernelPath,
-		)
-
-		source := "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(configContent))
-
-		ic.Storage.Files = append(ic.Storage.Files, ignTypes.File{
-			Node: ignTypes.Node{
-				Path: "/etc/kata-containers/kata-addon-kernel.conf",
-			},
-			FileEmbedded1: ignTypes.FileEmbedded1{
-				Contents: ignTypes.Resource{
-					Source: &source,
-				},
-				Mode: &mode,
-			},
-		})
-	}
-
-	icb, err := json.Marshal(ic)
-	if err != nil {
-		return nil, err
-	}
-
-	extension, err := r.getExtensionName()
-	if err != nil {
-		return nil, err
-	}
-
-	mc := mcfgv1.MachineConfig{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "machineconfiguration.openshift.io/v1",
-			Kind:       "MachineConfig",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: extension_mc_name,
-			Labels: map[string]string{
-				"machineconfiguration.openshift.io/role": machinePool,
-				"app":                                    r.kataConfig.Name,
-			},
-			Namespace: OperatorNamespace,
-		},
-		Spec: mcfgv1.MachineConfigSpec{
-			Extensions: []string{extension},
-			Config: runtime.RawExtension{
-				Raw: icb,
-			},
-		},
-	}
-
-	r.Log.Info("Extension based MachineConfig", "MachineConfig", mc)
-
-	return &mc, nil
-}
-
 func (r *KataConfigOpenShiftReconciler) addFinalizer() error {
 	r.Log.Info("Adding Finalizer for the KataConfig")
 	controllerutil.AddFinalizer(r.kataConfig, kataConfigFinalizer)
@@ -756,32 +455,6 @@ func (r *KataConfigOpenShiftReconciler) kataOcExists() (bool, error) {
 	return true, nil
 }
 
-func (r *KataConfigOpenShiftReconciler) checkConvergedCluster() (bool, error) {
-	//Check if only master and worker MCP exists
-	//Worker machinecount should be 0
-	listOpts := []client.ListOption{}
-	mcpList := &mcfgv1.MachineConfigPoolList{}
-	err := r.Client.List(context.TODO(), mcpList, listOpts...)
-	if err != nil {
-		r.Log.Error(err, "Unable to get the list of MCPs")
-		return false, err
-	}
-
-	numMcp := len(mcpList.Items)
-	r.Log.Info("Number of MCPs", "numMcp", numMcp)
-	if numMcp == 2 {
-		for _, mcp := range mcpList.Items {
-			if mcp.Name == "worker" && mcp.Status.MachineCount == 0 {
-				r.Log.Info("Converged Cluster")
-				return true, nil
-			}
-		}
-	}
-
-	return false, nil
-
-}
-
 func (r *KataConfigOpenShiftReconciler) checkNodeEligibility() error {
 	r.Log.Info("Check Node Eligibility to run Kata containers")
 	// Check if node eligibility label exists
@@ -801,19 +474,6 @@ func (r *KataConfigOpenShiftReconciler) checkNodeEligibility() error {
 	}
 
 	return nil
-}
-
-func (r *KataConfigOpenShiftReconciler) getMcpName() (string, error) {
-	isConvergedCluster, err := r.checkConvergedCluster()
-	if err != nil {
-		r.Log.Info("Error trying to find out if cluster is converged", "err", err)
-		return "", err
-	}
-	if isConvergedCluster {
-		return "master", nil
-	} else {
-		return "kata-oc", nil
-	}
 }
 
 func (r *KataConfigOpenShiftReconciler) createScc() error {
@@ -1056,16 +716,6 @@ func (r *KataConfigOpenShiftReconciler) getNodeSelectorAsMap() map[string]string
 
 func (r *KataConfigOpenShiftReconciler) getNodeSelectorAsLabelSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{MatchLabels: r.getNodeSelectorAsMap()}
-}
-
-func (r *KataConfigOpenShiftReconciler) isMcpUpdating(mcpName string) bool {
-	mcp := &mcfgv1.MachineConfigPool{}
-	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: mcpName}, mcp)
-	if err != nil {
-		r.Log.Info("Getting MachineConfigPool failed ", "machinePool", mcpName, "err", err)
-		return false
-	}
-	return apihelpers.IsMachineConfigPoolConditionTrue(mcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdating)
 }
 
 func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.Result, error) {
@@ -1368,54 +1018,6 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 	return ctrl.Result{}, nil
 }
 
-// If the first return value is 'true' it means that the MC was just created
-// by this call, 'false' means that it's already existed.  As usual, the first
-// return value is only valid if the second one is nil.
-func (r *KataConfigOpenShiftReconciler) createMc(machinePool string, customKernelCfg *customKernelConfig) (bool, error) {
-
-	// In case we're returning an error we want to make it explicit that
-	// the first return value is "not care".  Unfortunately golang seems
-	// to lack syntax for creating an expression with default bool value
-	// hence this work-around.
-	var dummy bool
-
-	/* Create Machine Config object to install sandboxed containers */
-
-	r.Log.Info("creating RHCOS MachineConfig")
-	mc, err := r.newMCForCR(machinePool, customKernelCfg)
-	if err != nil {
-		return dummy, err
-	}
-
-	existingMc := &mcfgv1.MachineConfig{}
-	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: mc.Name}, existingMc)
-	if err != nil && (k8serrors.IsNotFound(err) || k8serrors.IsGone(err)) {
-
-		err = r.Client.Create(context.TODO(), mc)
-		if err != nil {
-			r.Log.Error(err, "Failed to create a new MachineConfig ", "mc.Name", mc.Name)
-			return dummy, err
-		}
-		r.Log.Info("MachineConfig successfully created", "mc.Name", mc.Name)
-		return true, nil
-	} else if err != nil {
-		r.Log.Info("failed to retrieve MachineConfig", "err", err)
-		return dummy, err
-	} else if !reflect.DeepEqual(existingMc.Spec, mc.Spec) {
-		r.Log.Info("MachineConfig spec changed, updating", "mc.Name", mc.Name)
-		existingMc.Spec = mc.Spec
-		if err := r.Client.Update(context.TODO(), existingMc); err != nil {
-			r.Log.Error(err, "Failed to update MachineConfig", "mc.Name", mc.Name)
-			return dummy, err
-		}
-		return false, nil
-	} else {
-		r.Log.Info("MachineConfig already exists")
-		return false, nil
-	}
-
-}
-
 func (r *KataConfigOpenShiftReconciler) makeReconcileRequest() reconcile.Request {
 	return reconcile.Request{
 		NamespacedName: types.NamespacedName{
@@ -1552,17 +1154,6 @@ func (r *KataConfigOpenShiftReconciler) unlabelNodes(nodeSelector labels.Selecto
 		}
 	}
 	return labelingChanged, nil
-}
-
-//lint:ignore U1000 This method is unused, but let's keep it for now
-func (r *KataConfigOpenShiftReconciler) getConditionReason(conditions []mcfgv1.MachineConfigPoolCondition, conditionType mcfgv1.MachineConfigPoolConditionType) string {
-	for _, c := range conditions {
-		if c.Type == conditionType {
-			return c.Message
-		}
-	}
-
-	return ""
 }
 
 func (r *KataConfigOpenShiftReconciler) isInstalling() bool {
