@@ -18,7 +18,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"maps"
 	"reflect"
 	"time"
 
@@ -27,9 +26,7 @@ import (
 	secv1 "github.com/openshift/api/security/v1"
 	kataconfigurationv1 "github.com/openshift/sandboxed-containers-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
-	nodeapi "k8s.io/api/node/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -361,137 +358,6 @@ func (r *KataConfigOpenShiftReconciler) createScc() error {
 		err = r.Client.Create(context.TODO(), scc)
 		if err != nil {
 			return err
-		}
-	}
-
-	return nil
-}
-
-// createRuntimeClass creates a runtimeclass if it doesn't exist
-// When checkNodeEligibility is set to true, prior to creation
-// it verifies if nodes that support this runtime class exist. This
-// is done by checking if nodes have all labels in additionalNodeLabels.
-func (r *KataConfigOpenShiftReconciler) createRuntimeClass(
-	runtimeClassName string,
-	cpuOverhead string,
-	memoryOverhead string,
-	extResOverhead string,
-	handler string,
-	additionalNodeLabels map[string]string) error {
-
-	if r.kataConfig.Spec.CheckNodeEligibility {
-
-		r.Log.Info("filtering nodes with labels", "labels", additionalNodeLabels)
-		selector, err := r.getKataConfigNodeSelectorAsSelector()
-		if err != nil {
-			return fmt.Errorf("failed to build node selector: %w", err)
-		}
-
-		nodes := &corev1.NodeList{}
-		listOpts := []client.ListOption{
-			client.MatchingLabelsSelector{Selector: selector},
-			client.MatchingLabels(additionalNodeLabels),
-		}
-		if err := r.Client.List(context.TODO(), nodes, listOpts...); err != nil {
-			return fmt.Errorf("failed to list nodes: %w", err)
-		}
-
-		if len(nodes.Items) == 0 {
-			r.Log.Info("skipping creating runtimeclass due to missing labels", "runtimeclass", runtimeClassName)
-			return nil
-		}
-	}
-
-	rc := func() *nodeapi.RuntimeClass {
-		podFixed := corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(cpuOverhead),
-			corev1.ResourceMemory: resource.MustParse(memoryOverhead),
-		}
-
-		// Add extended resource if provided
-		if extResOverhead != "" {
-			podFixed[corev1.ResourceName(extResOverhead)] = resource.MustParse("1")
-		}
-
-		rc := &nodeapi.RuntimeClass{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: "node.k8s.io/v1",
-				Kind:       "RuntimeClass",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:       runtimeClassName,
-				Finalizers: []string{runtimeClassFinalizerName},
-			},
-			Handler: handler,
-			Overhead: &nodeapi.Overhead{
-				PodFixed: podFixed,
-			},
-		}
-
-		nodeSelector := r.getNodeSelectorAsMap()
-
-		// Add additional node label if provided
-		if r.kataConfig.Spec.CheckNodeEligibility && additionalNodeLabels != nil {
-			maps.Copy(nodeSelector, additionalNodeLabels)
-		}
-
-		rc.Scheduling = &nodeapi.Scheduling{
-			NodeSelector: nodeSelector,
-		}
-
-		r.Log.Info("RuntimeClass", "name", runtimeClassName, "nodeSelector", nodeSelector)
-
-		return rc
-	}()
-
-	// Set Kataconfig r.kataConfig as the owner and controller
-	if err := controllerutil.SetControllerReference(r.kataConfig, rc, r.Scheme); err != nil {
-		return err
-	}
-
-	foundRc := &nodeapi.RuntimeClass{}
-	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: rc.Name}, foundRc)
-	if err != nil {
-		if !k8serrors.IsNotFound(err) {
-			return err
-		}
-
-		r.Log.Info("Creating a new RuntimeClass", "rc.Name", rc.Name)
-		err = r.Client.Create(context.TODO(), rc)
-		if err != nil {
-			return fmt.Errorf("error creating %s runtime class: %w", rc.Name, err)
-		}
-	}
-
-	if !contains(r.kataConfig.Status.RuntimeClasses, runtimeClassName) {
-		r.kataConfig.Status.RuntimeClasses = append(r.kataConfig.Status.RuntimeClasses, runtimeClassName)
-	}
-
-	return nil
-}
-
-func (r *KataConfigOpenShiftReconciler) deleteRuntimeClass(runtimeClassName string) error {
-
-	foundRc := &nodeapi.RuntimeClass{}
-	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: runtimeClassName}, foundRc)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-
-	if err := r.Client.Delete(context.TODO(), foundRc); err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-
-	for i, name := range r.kataConfig.Status.RuntimeClasses {
-		if name == runtimeClassName {
-			r.kataConfig.Status.RuntimeClasses = append(r.kataConfig.Status.RuntimeClasses[:i], r.kataConfig.Status.RuntimeClasses[i+1:]...)
-			break
 		}
 	}
 
